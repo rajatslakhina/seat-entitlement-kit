@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux · swift build (warnings as errors) + swift test
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clean build, warnings are errors
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+      - name: Tests
+        run: swift test
+
+  apple:
+    name: macOS · swift test + iOS Simulator build of every module
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: xcodebuild -version && swift --version
+      - name: swift build (warnings as errors, includes the SwiftUI module)
+        run: swift build --build-tests -Xswiftc -warnings-as-errors
+      - name: swift test (includes the CryptoKit ES256 test)
+        run: swift test
+      - name: xcodebuild for any iOS Simulator
+        run: |
+          xcodebuild build -scheme SeatEntitlements-Package \
+            -destination 'generic/platform=iOS Simulator' \
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=YES CODE_SIGNING_ALLOWED=NO
