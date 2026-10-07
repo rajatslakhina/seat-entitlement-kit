@@ -5,7 +5,13 @@
 [![CI](https://github.com/rajatslakhina/seat-entitlement-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/rajatslakhina/seat-entitlement-kit/actions/workflows/ci.yml)
 ![Swift 6 language mode](https://img.shields.io/badge/Swift-6%20language%20mode-orange) ![Platforms](https://img.shields.io/badge/platforms-iOS%2017%20%7C%20macOS%2014-blue) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-Demo app: (added after the companion repo is pushed — see below)
+**Demo app: [seat-entitlement-kit-demo-app](https://github.com/rajatslakhina/seat-entitlement-kit-demo-app)**, a SwiftUI console that consumes this package by release tag. Its CI runs it on an iOS Simulator and captures the screenshots below.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/rajatslakhina/seat-entitlement-kit-demo-app/main/Demo/Screenshots/2-offline-grace.png" width="30%" alt="30 hours offline after an undelivered reassignment: fail-open on grace, fail-closed blocked">
+  <img src="https://raw.githubusercontent.com/rajatslakhina/seat-entitlement-kit-demo-app/main/Demo/Screenshots/3-revoked-online.png" width="30%" alt="Reassignment pushed online: revoked immediately">
+  <img src="https://raw.githubusercontent.com/rajatslakhina/seat-entitlement-kit-demo-app/main/Demo/Screenshots/4-rollout-herd.png" width="30%" alt="Rollout herd model">
+</p>
 
 ---
 
@@ -64,21 +70,24 @@ Feature code calls one method, `await resolver.decide(feature)`, and gets back a
 
 **2. A strict total order, not "highest version wins".** Same-version ties are real: StoreKit and the server can describe the same transition, and MDM can echo it. The order is version, then source rank (server > StoreKit > managed config), then **revoke wins** (refunded > expired > unassigned > assigned), then deterministic tie-breaks, with a final fallback so even a decoded NaN date cannot make two different events incomparable. *Trade-off:* a same-version conflict resolves towards *less* access, so a user may be briefly denied and then re-granted by the next version. That is the right failure direction for paid seats. *Proof:* `testLedgerConvergesUnderEveryPermutation` applies all 720 orderings of a six-event fixture. The same harness is fed a last-arrival-wins reducer and a version-only reducer, and must flag both (`testConvergenceHarnessCatchesLastArrivalWins`, `…VersionOnlyOrdering`), so the check is shown to be able to fail.
 
-**3. Known revocations are honoured immediately and durably; staleness is a separate question.** If the ledger knows a seat moved away from this holder, the answer is `.deny(.revoked)` regardless of freshness, grace, or whether anything was ever verified. Grace only covers *not knowing*. A pushed revocation is written to the `RevocationJournal` before `ingest` returns, so it survives the process being killed and reaches Suite siblings. The journal is compacted only when a *signed* snapshot contains the same event or a newer one. *The asymmetry is deliberate:* pushed events are not signed snapshots, so the journal never stores an event that would grant this holder anything. A forged or corrupted journal can deny access but never unlock it, and pushed grants become durable only when a signed snapshot confirms them. (`testPushedRevocationSurvivesRelaunchViaJournal`, `testPushedGrantsAreNeverJournalled`, `testJournalIsCompactedOnlyWhenSignedStateCatchesUp`)
+**3. Known revocations are honoured immediately and durably; staleness is a separate question.** If the ledger knows a seat moved away from this holder, the answer is `.deny(.revoked)` regardless of freshness, grace, or whether anything was ever verified. Grace only covers *not knowing*. A pushed revocation is written to the `RevocationJournal` before `ingest` returns, so it survives the process being killed and reaches Suite siblings. The journal is compacted only when a *signed* snapshot contains the same event or a newer one. Only changes that take a seat *away from this holder* are journalled; other holders' seat moves are not, so the journal cannot fill with entries no snapshot compacts. *The asymmetry is deliberate:* pushed events are not signed snapshots, so the journal never stores an event that would grant this holder anything. A forged or corrupted journal can deny access but never unlock it, and pushed grants become durable only when a signed snapshot confirms them. (`testPushedRevocationSurvivesRelaunchViaJournal`, `testPushedGrantsAreNeverJournalled`, `testJournalIsCompactedOnlyWhenSignedStateCatchesUp`)
 
 **4. Fail-open vs fail-closed is a per-feature product decision.** Opening your own notebooks offline keeps working through the grace window. Exporting a graded PDF or spending server AI compute requires state verified within `freshFor`. *Rejected:* one app-wide TTL, which forces the same availability/abuse trade-off onto features with very different costs.
 
 **5. The revocation-latency bound is a number you can state.** With the demo's policy (fresh 6 h, grace 72 h), a seat reassigned while a device is offline keeps fail-open features working for at most **78 hours**, and fail-closed features for at most **6 hours**. Online, a server push lands immediately, and the scheduled refresh is the fallback. *Trade-off:* a longer grace means fewer locked-out students on a dead Wi-Fi weekend and a longer tail for a reassigned seat. The library makes the bound explicit; it does not pick it for you.
 
-**6. Three clock defences, and the larger age wins.** State age is `max(wall-clock age, monotonic uptime age)`, and "now" is never earlier than a persisted **wall-clock floor**, the latest time this device has ever observed.
-* Moving the date back in Settings cannot shrink the age while the process holds a monotonic reading (`testMonotonicReadingFromOwnRefreshDefeatsClockTamper`). Re-reading its own saved snapshot cannot erase that reading either (`testBootstrapOfOwnSavedSnapshotKeepsMonotonicReading`).
-* After a reboot there is no monotonic reading, so the floor takes over. A wall clock more than `clockSkewTolerance` behind the floor is a `.clockRollback` denial (`testPersistedClockFloorCatchesRewindAfterReboot`).
-* A device clock that runs *slow* must not lock anyone out. Verification time is `min(server issuedAt, device clock at receipt)`, so a fresh snapshot is accepted and aged from when it arrived. Only dates more than a year ahead are refused (`testSlowDeviceClockStillAdoptsAndCountsFromReceipt`).
+**6. Clocks: a fresh refresh is the anchor, and between refreshes the larger age wins.** *(Reworked in 1.1.0 after review.)*
+* **A snapshot this process fetched is a new proof.** It is aged from its *receipt* on the device's own clock, with a monotonic uptime reading and a boot id. It also re-anchors the persisted **wall-clock floor** (the latest wall time the device has seen). As a result, no device-clock error can lock out a device that is online and verified: running fast (`testFastDeviceClockIsFreshRightAfterRefresh`), running slow (`testSlowDeviceClockStillAdoptsAndCountsFromReceipt`), rewound (`testRefreshAfterClockRewindRenewsFreshness`), or set forward once (`testOnlineRefreshClearsAFloorPoisonedByAClockSetForward`). 1.0.0 got the fast, rewound and set-forward cases wrong.
+* **Between refreshes, age is `max(wall-clock age, monotonic age)`, and "now" is never earlier than the floor.**
+  * Moving the date back cannot shrink the age while a monotonic reading exists (`testMonotonicReadingFromOwnRefreshDefeatsClockTamper`).
+  * The reading is persisted with its boot id, so it survives an app relaunch within the same boot (`testPersistedMonotonicReadingSurvivesRelaunchInSameBoot`). It is ignored after a reboot (`testPersistedMonotonicReadingIgnoredAcrossBoots`).
+  * After a reboot the floor takes over. A wall clock more than `clockSkewTolerance` behind it is a `.clockRollback` denial (`testPersistedClockFloorCatchesRewindAfterReboot`).
+* Snapshots read from the shared store (written by a sibling) are aged from `min(server issuedAt, device clock)` and only ever move verification forward.
 
-*Limits:*
-* The floor is persisted when it has moved at least 60 s, fire-and-forget. A rewind made within that window before a reboot can recover at most that much plus the skew tolerance.
-* A legitimate backwards correction (a fast clock fixed by NTP) makes the floor overstate age until real time passes it, which is the conservative direction.
-* Closing the remaining gap fully needs server-attested time, which is out of scope.
+*Limits, stated plainly:*
+* The floor only knows wall times the app actually observed. A user who goes offline, **reboots**, and rewinds the clock can recover the time the app was not running, up to the full grace window. Closing that needs server-attested time (or a trusted time source), which is out of scope.
+* A refresh trusts the feed to return *current* state. A feed that serves a cached old snapshot with a sequence at or above the high-water mark is still treated as fresh from receipt.
+* The floor is persisted fire-and-forget once it has moved 60 s, so a crash can lose up to that much of it.
 
 **7. Anti-rollback lives somewhere a backup can't restore.** The App Group cache can be rolled back (backup restore, a Suite sibling writing late), so every reader re-verifies it and rejects any sequence below the device's high-water mark, which belongs in a `ThisDeviceOnly` keychain item. Sibling write races are therefore *detected*, not prevented: the worst case is a refused cache and a refresh, never a resurrected seat. *Rejected:* `NSFileCoordinator` locking alone, because it cannot defend against restored state.
 
@@ -92,7 +101,7 @@ Feature code calls one method, `await resolver.decide(feature)`, and gets back a
 | Synchronized, full-jitter retry | 5,000 (20.0× capacity) | 17,191 | 9 m 30 s |
 | **Deterministic 1 h slot + full-jitter retry** | **27 (0.1× capacity)** | **5,000** | **60 m** |
 
-Backoff: 30 s base, 600 s cap, full jitter, default seed. Jittered retries alone cut wasted requests by two thirds but do nothing about the first spike. The slot removes the spike entirely, at the price of a one-hour spread, which is exactly the trade a lead has to sign off on. *Caveat, stated plainly:* the model counts load only. It does not simulate a backend degrading under 20× load, which flatters both synchronized rows. Every number in this table is pinned by `testHerdTableNumbersInTheReadme`.
+Backoff: 30 s base, 600 s cap, full jitter, default seed. Jittered retries alone cut total requests by about two thirds (wasted retries by 74%), but do nothing about the first spike. The slot removes the spike entirely, at the price of a one-hour spread, which is exactly the trade a lead has to sign off on. *Caveat, stated plainly:* the model counts load only. It does not simulate a backend degrading under 20× load, which flatters both synchronized rows. Every number in this table is pinned by `testHerdTableNumbersInTheReadme`.
 
 **10. Bounded everything.** Ledger capacity, subscriber count, per-subscriber buffers, scenario sizes, and `Saturating` arithmetic for every conversion reachable from the public API (`Int(Double)`, `2^attempt`, `Retry-After: 1e300`). Ceilings derive from `Int.max`, never a 64-bit literal.
 
@@ -106,7 +115,7 @@ Backoff: 30 s base, 600 s cap, full jitter, default seed. Jittered retries alone
 ## Install
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/seat-entitlement-kit.git", from: "1.0.0")
+.package(url: "https://github.com/rajatslakhina/seat-entitlement-kit.git", from: "1.1.0")
 ```
 
 ```swift
@@ -140,10 +149,17 @@ case .deny(let reason): showPaywallOrExplanation(reason)
 
 ## Verification
 
-- `swift build --build-tests -Xswiftc -warnings-as-errors` from a deleted `.build`, then `swift test`, on Linux (Swift 6.1.2): **88 tests, 0 failures**. The ES256 test is compiled only where CryptoKit exists, so Linux runs 88 and macOS runs 89.
-- Mutation check: **20 hand-made source mutations, each killed by at least one test.** They cover: single-flight removed, known-revocation check removed, restrictiveness tie-break removed, monotonic clock ignored, high-water ignored, dedup always admits, grace boundary off by one, wrong FNV prime, subscriber cleanup removed, verification allowed to regress, snapshot replaces the ledger, clock floor ignored, grants journalled, journal compacted against the ledger instead of signed state, store-save guard removed, bootstrap writing the store, journal not replayed, `deinit` not finishing streams, strict future-date check, and every change published twice. Two of these first *survived* an earlier test suite (restrictiveness, and publish-twice), and the tests that now kill them were added because of that.
-- CI: (written after CI reports — see below)
-- Simulator: (written after the demo run — see below)
+- `swift build --build-tests -Xswiftc -warnings-as-errors` from a deleted `.build`, then `swift test`, on Linux (Swift 6.1.2): **96 tests, 0 failures**. The ES256 test is compiled only where CryptoKit exists, so Linux runs 96 and macOS runs 97.
+- Mutation check: **27 hand-made source mutations, each killed by at least one test.**
+  - The original 20 cover: single-flight removed, known-revocation check removed, restrictiveness tie-break removed, monotonic clock ignored, high-water ignored, dedup always admits, grace boundary off by one, wrong FNV prime, subscriber cleanup removed, verification allowed to regress, snapshot replaces the ledger, clock floor ignored, grants journalled, journal compacted against the ledger instead of signed state, store-save guard removed, bootstrap writing the store, journal not replayed, `deinit` not finishing streams, strict future-date check, and every change published twice.
+  - Seven more were added for 1.1.0: network adoption kept forward-only, no floor reset on refresh, boot id ignored, persisted evidence not loaded, journal applied after the store, every non-granting event journalled, and aging from `issuedAt` instead of receipt.
+  - Two mutations first *survived* an earlier suite (restrictiveness, and publish-twice). The tests that now kill them were added because of that.
+- CI ([Actions](https://github.com/rajatslakhina/seat-entitlement-kit/actions)), on every push to `main`:
+  - **Linux**, `swift:6.0` container: `swift build --build-tests -Xswiftc -warnings-as-errors`, then `swift test`.
+  - **macOS** (`macos-15`): the same warnings-as-errors build, which also compiles the SwiftUI module; `swift test` (89 tests, including the CryptoKit ES256 round trip); and `xcodebuild` of every module for `generic/platform=iOS Simulator` with warnings as errors.
+  - The first macOS run failed on a real Swift 6 isolation error in the SwiftUI module, which Linux cannot compile. It was fixed before `v1.0.0` was tagged.
+- Releases: `v1.0.0`, then `v1.1.0` with the clock-model fixes from the second independent review (additive API: `ClockFloorStore.reset/loadVerification/saveVerification` and `EntitlementClock.bootID` have default implementations, so 1.0 conformers still compile).
+- Simulator: this package has no app. The [demo app](https://github.com/rajatslakhina/seat-entitlement-kit-demo-app#verification)'s CI builds it against this release, installs it on an iOS Simulator, launches four scripted states and captures the screenshots above. It has not been run by hand on a developer Mac: the scheduled job that builds these repos was granted Simulator access, but Xcode had an unrelated project open, so it did not touch it.
 
 ## License
 
