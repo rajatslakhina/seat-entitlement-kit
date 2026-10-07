@@ -61,7 +61,7 @@ Feature code calls one method, `await resolver.decide(feature)`, and gets back a
 | `SnapshotStore`, `HighWaterMarkStore`, `ClockFloorStore`, `RevocationJournal` | Ports for the App Group cache shared by Suite siblings, the device-only high-water mark, the persisted wall-clock floor, and the journal that makes pushed revocations durable. In-memory implementations ship for tests and the demo. |
 | `RefreshScheduler`, `StableHash`, `SplitMix64` | A deterministic per-device refresh slot (FNV-1a, not `Hasher`, so the slot survives relaunch and siblings agree on it) plus full-jitter exponential backoff with `Retry-After` as a floor. |
 | `HerdSimulator` | A discrete-time model of a fleet hitting the backend, used to argue the jitter decision with numbers (see below). |
-| `EntitlementResolver` | The actor that ties it together: single-flight `refresh()`, `bootstrap()` (clock floor, then a sibling's cache, then the revocation journal), `ingest()` for pushed events, `decide()`, and a bounded `AsyncStream<SeatChange>` fan-out (64 subscribers max, newest-64 buffer each, cleaned up on cancellation). `ChangeDeduplicator` makes consumers idempotent. |
+| `EntitlementResolver` | The actor that ties it together: single-flight `refresh()`, `bootstrap()` (clock evidence, then the revocation journal, then a sibling's cache), `ingest()` for pushed events, `decide()`, and a bounded `AsyncStream<SeatChange>` fan-out (64 subscribers max, newest-64 buffer each, cleaned up on cancellation). `ChangeDeduplicator` makes consumers idempotent. |
 | `SeatEntitlementsUI` | `SeatConsoleView`, the operator console the demo app runs (SwiftUI + CryptoKit, Apple platforms only). |
 
 ## Design decisions, trade-offs and rejected alternatives
@@ -76,8 +76,8 @@ Feature code calls one method, `await resolver.decide(feature)`, and gets back a
 
 **5. The revocation-latency bound is a number you can state.** With the demo's policy (fresh 6 h, grace 72 h), a seat reassigned while a device is offline keeps fail-open features working for at most **78 hours**, and fail-closed features for at most **6 hours**. Online, a server push lands immediately, and the scheduled refresh is the fallback. *Trade-off:* a longer grace means fewer locked-out students on a dead Wi-Fi weekend and a longer tail for a reassigned seat. The library makes the bound explicit; it does not pick it for you.
 
-**6. Clocks: a fresh refresh is the anchor, and between refreshes the larger age wins.** *(Reworked in 1.1.0 after review.)*
-* **A snapshot this process fetched is a new proof.** It is aged from its *receipt* on the device's own clock, with a monotonic uptime reading and a boot id. It also re-anchors the persisted **wall-clock floor** (the latest wall time the device has seen). As a result, no device-clock error can lock out a device that is online and verified: running fast (`testFastDeviceClockIsFreshRightAfterRefresh`), running slow (`testSlowDeviceClockStillAdoptsAndCountsFromReceipt`), rewound (`testRefreshAfterClockRewindRenewsFreshness`), or set forward once (`testOnlineRefreshClearsAFloorPoisonedByAClockSetForward`). 1.0.0 got the fast, rewound and set-forward cases wrong.
+**6. Clocks: a fresh refresh is the anchor, and between refreshes the larger age wins.** *(Reworked in 1.1.0 and 1.1.1 after review.)*
+* **A snapshot this process fetched, whose server `issuedAt` is later than the last one accepted, is a new proof.** It is aged from its *receipt* on the device's own clock, with a monotonic uptime reading and a boot id. It also re-anchors the persisted **wall-clock floor** (the latest wall time the device has seen). As a result, no device-clock error can lock out a device that is online and verified: running fast (`testFastDeviceClockIsFreshRightAfterRefresh`), running slow (`testSlowDeviceClockStillAdoptsAndCountsFromReceipt`), rewound (`testRefreshAfterClockRewindRenewsFreshness`), or set forward once (`testOnlineRefreshClearsAFloorPoisonedByAClockSetForward`). 1.0.0 got the fast, rewound and set-forward cases wrong.
 * **Between refreshes, age is `max(wall-clock age, monotonic age)`, and "now" is never earlier than the floor.**
   * Moving the date back cannot shrink the age while a monotonic reading exists (`testMonotonicReadingFromOwnRefreshDefeatsClockTamper`).
   * The reading is persisted with its boot id, so it survives an app relaunch within the same boot (`testPersistedMonotonicReadingSurvivesRelaunchInSameBoot`). It is ignored after a reboot (`testPersistedMonotonicReadingIgnoredAcrossBoots`).
@@ -85,9 +85,11 @@ Feature code calls one method, `await resolver.decide(feature)`, and gets back a
 * Snapshots read from the shared store (written by a sibling) are aged from `min(server issuedAt, device clock)` and only ever move verification forward.
 
 *Limits, stated plainly:*
-* The floor only knows wall times the app actually observed. A user who goes offline, **reboots**, and rewinds the clock can recover the time the app was not running, up to the full grace window. Closing that needs server-attested time (or a trusted time source), which is out of scope.
-* A refresh trusts the feed to return *current* state. A feed that serves a cached old snapshot with a sequence at or above the high-water mark is still treated as fresh from receipt.
-* The floor is persisted fire-and-forget once it has moved 60 s, so a crash can lose up to that much of it.
+* **Replays are not proofs.** A network snapshot counts as a new proof only if its server `issuedAt` is later than the last one accepted, which is persisted with the clock evidence. A proxy or cache that re-serves an old signed snapshot cannot renew freshness, even after a relaunch (`testReplayedSnapshotDoesNotRenewFreshness`, `testReplayAfterRelaunchDoesNotRenewFreshness`). 1.1.0 had this hole; 1.1.1 closes it. This compares server time only with server time, so the device-clock fixes above still hold.
+* **Sleep counts.** The production clock's uptime includes time asleep (`CLOCK_MONOTONIC_RAW` / `mach_continuous_time` on Apple platforms, `CLOCK_BOOTTIME` on Linux). An iPad that sleeps offline all weekend cannot recover the weekend with a clock rewind. The boot id is `kern.bootsessionuuid`, which, unlike `kern.boottime`, does not change when the calendar clock is stepped. *Not exercised by CI on a real sleeping device; the tests use an injected clock.*
+* **What is still recoverable:** offline + **reboot** + rewind. A reboot discards the monotonic reading, and the floor only knows wall times the app observed, so the time the app was not running can be recovered, up to the grace window. Closing that needs server-attested time, which is out of scope.
+* **A forward correction is conservative.** If a refresh happens while the clock is slow or rewound and the clock is then corrected forward, the wall-clock age jumps by the correction. State can then look older than it is until the next refresh. This errs towards denial and an online refresh clears it.
+* The floor is persisted fire-and-forget once it has moved 60 s, and a raise observed before a reset is dropped, so a crash can lose up to a minute of it.
 
 **7. Anti-rollback lives somewhere a backup can't restore.** The App Group cache can be rolled back (backup restore, a Suite sibling writing late), so every reader re-verifies it and rejects any sequence below the device's high-water mark, which belongs in a `ThisDeviceOnly` keychain item. Sibling write races are therefore *detected*, not prevented: the worst case is a refused cache and a refresh, never a resurrected seat. *Rejected:* `NSFileCoordinator` locking alone, because it cannot defend against restored state.
 
@@ -115,7 +117,7 @@ Backoff: 30 s base, 600 s cap, full jitter, default seed. Jittered retries alone
 ## Install
 
 ```swift
-.package(url: "https://github.com/rajatslakhina/seat-entitlement-kit.git", from: "1.1.0")
+.package(url: "https://github.com/rajatslakhina/seat-entitlement-kit.git", from: "1.1.1")
 ```
 
 ```swift
@@ -149,16 +151,20 @@ case .deny(let reason): showPaywallOrExplanation(reason)
 
 ## Verification
 
-- `swift build --build-tests -Xswiftc -warnings-as-errors` from a deleted `.build`, then `swift test`, on Linux (Swift 6.1.2): **96 tests, 0 failures**. The ES256 test is compiled only where CryptoKit exists, so Linux runs 96 and macOS runs 97.
-- Mutation check: **27 hand-made source mutations, each killed by at least one test.**
+- `swift build --build-tests -Xswiftc -warnings-as-errors` from a deleted `.build`, then `swift test`, on Linux (Swift 6.1.2): **100 tests, 0 failures**. The ES256 test is compiled only where CryptoKit exists, so Linux runs 100 and macOS runs 101.
+- Mutation check: **29 hand-made source mutations, each killed by at least one test.**
   - The original 20 cover: single-flight removed, known-revocation check removed, restrictiveness tie-break removed, monotonic clock ignored, high-water ignored, dedup always admits, grace boundary off by one, wrong FNV prime, subscriber cleanup removed, verification allowed to regress, snapshot replaces the ledger, clock floor ignored, grants journalled, journal compacted against the ledger instead of signed state, store-save guard removed, bootstrap writing the store, journal not replayed, `deinit` not finishing streams, strict future-date check, and every change published twice.
   - Seven more were added for 1.1.0: network adoption kept forward-only, no floor reset on refresh, boot id ignored, persisted evidence not loaded, journal applied after the store, every non-granting event journalled, and aging from `issuedAt` instead of receipt.
+  - Two more for 1.1.1: the replay guard removed, and the last server `issuedAt` not restored from persisted evidence. The floor-write ordering guard has no test that can observe it, so it is not mutation-checked.
   - Two mutations first *survived* an earlier suite (restrictiveness, and publish-twice). The tests that now kill them were added because of that.
 - CI ([Actions](https://github.com/rajatslakhina/seat-entitlement-kit/actions)), on every push to `main`:
   - **Linux**, `swift:6.0` container: `swift build --build-tests -Xswiftc -warnings-as-errors`, then `swift test`.
-  - **macOS** (`macos-15`): the same warnings-as-errors build, which also compiles the SwiftUI module; `swift test` (89 tests, including the CryptoKit ES256 round trip); and `xcodebuild` of every module for `generic/platform=iOS Simulator` with warnings as errors.
+  - **macOS** (`macos-15`): the same warnings-as-errors build, which also compiles the SwiftUI module; `swift test` (101 tests, including the CryptoKit ES256 round trip); and `xcodebuild` of every module for `generic/platform=iOS Simulator` with warnings as errors.
   - The first macOS run failed on a real Swift 6 isolation error in the SwiftUI module, which Linux cannot compile. It was fixed before `v1.0.0` was tagged.
-- Releases: `v1.0.0`, then `v1.1.0` with the clock-model fixes from the second independent review (additive API: `ClockFloorStore.reset/loadVerification/saveVerification` and `EntitlementClock.bootID` have default implementations, so 1.0 conformers still compile).
+- Releases:
+  - `v1.0.0`.
+  - `v1.1.0`: clock-model fixes from the second independent review. The API change is additive: `ClockFloorStore.reset/loadVerification/saveVerification` and `EntitlementClock.bootID` have default implementations.
+  - `v1.1.1`: the third review's findings (replayed snapshots renewing freshness, a sleep-pausing uptime clock, an unstable boot id, floor-write ordering). **The 1.1.1 changes were not independently re-reviewed**, because the review loop is capped at three rounds. They are covered by the tests and mutations above.
 - Simulator: this package has no app. The [demo app](https://github.com/rajatslakhina/seat-entitlement-kit-demo-app#verification)'s CI builds it against this release, installs it on an iOS Simulator, launches four scripted states and captures the screenshots above. It has not been run by hand on a developer Mac: the scheduled job that builds these repos was granted Simulator access, but Xcode had an unrelated project open, so it did not touch it.
 
 ## License
