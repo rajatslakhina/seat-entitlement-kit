@@ -302,7 +302,7 @@ public final class SeatConsoleModel: ObservableObject {
 
     // MARK: Herd
 
-    static func runHerd(_ herd: HerdScenario, scheduler: RefreshScheduler) -> [HerdRow] {
+    nonisolated static func runHerd(_ herd: HerdScenario, scheduler: RefreshScheduler) -> [HerdRow] {
         let strategies: [HerdStrategy] = [
             .synchronized(retryAfter: 30),
             .synchronizedWithJitteredRetry(scheduler),
@@ -315,7 +315,7 @@ public final class SeatConsoleModel: ObservableObject {
     }
 
     /// Max-pooling so a one-bucket spike is never averaged away.
-    static func downsample(_ values: [Int], to count: Int) -> [Int] {
+    nonisolated static func downsample(_ values: [Int], to count: Int) -> [Int] {
         guard count > 0, !values.isEmpty else { return [] }
         let size = max(1, (values.count + count - 1) / count)
         return stride(from: 0, to: values.count, by: size).map { start in
@@ -325,14 +325,14 @@ public final class SeatConsoleModel: ObservableObject {
 
     // MARK: Formatting
 
-    static func timestamp(_ date: Date) -> String {
+    nonisolated static func timestamp(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "EEE HH:mm"
         formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter.string(from: date)
     }
 
-    static func format(_ seconds: TimeInterval) -> String {
+    nonisolated static func format(_ seconds: TimeInterval) -> String {
         guard seconds.isFinite else { return "∞" }
         let total = Saturating.int(abs(seconds))
         let hours = total / 3_600
