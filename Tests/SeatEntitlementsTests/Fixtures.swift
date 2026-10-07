@@ -40,11 +40,15 @@ final class TestClock: EntitlementClock, @unchecked Sendable {
     private let lock = NSLock()
     private var wall: Date
     private var up: TimeInterval?
+    private var boot: String?
 
-    init(now: Date = t0, uptime: TimeInterval? = 1_000) {
+    init(now: Date = t0, uptime: TimeInterval? = 1_000, bootID: String? = nil) {
         wall = now
         up = uptime
+        boot = bootID
     }
+
+    func bootID() -> String? { lock.withLock { boot } }
 
     func now() -> Date { lock.withLock { wall } }
     func uptime() -> TimeInterval? { lock.withLock { up } }

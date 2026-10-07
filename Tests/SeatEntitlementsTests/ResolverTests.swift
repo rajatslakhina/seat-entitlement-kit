@@ -388,4 +388,124 @@ final class ResolverTests: XCTestCase {
         }
         XCTAssertTrue(finished, "a consumer must not hang on a deallocated resolver")
     }
+
+    // MARK: Review round 2 regressions (clock model, 1.1.0)
+
+    /// A clock set forward once poisons the floor. A successful online refresh
+    /// must clear it: the device is online and verified.
+    func testOnlineRefreshClearsAFloorPoisonedByAClockSetForward() async {
+        let clock = TestClock()
+        let feed = GatedFeed([signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted])),
+                              signed(EntitlementSnapshot(sequence: 2, issuedAt: t0.addingTimeInterval(60), seats: [granted]))], open: true)
+        let resolver = makeResolver(feed: feed, clock: clock)
+        _ = await resolver.refresh()
+        clock.setWall(t0.addingTimeInterval(5 * 86_400)) // user sets the date 5 days ahead
+        _ = await resolver.decide(docs)                   // floor observes it
+        clock.setWall(t0.addingTimeInterval(60))          // clock corrected
+        let outcome = await resolver.refresh()
+        XCTAssertEqual(outcome, .adopted(sequence: 2, changes: 0))
+        let docsDecision = await resolver.decide(docs)
+        let exportDecision = await resolver.decide(export)
+        XCTAssertEqual(docsDecision, .allow(.verified(age: 0)))
+        XCTAssertEqual(exportDecision, .allow(.verified(age: 0)))
+    }
+
+    /// After the clock is moved back, a successful refresh must renew freshness.
+    func testRefreshAfterClockRewindRenewsFreshness() async {
+        let clock = TestClock()
+        let feed = GatedFeed([signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted])),
+                              signed(EntitlementSnapshot(sequence: 2, issuedAt: t0.addingTimeInterval(7 * 3_600), seats: [granted]))], open: true)
+        let resolver = makeResolver(feed: feed, clock: clock)
+        _ = await resolver.refresh()
+        clock.setWall(t0.addingTimeInterval(-48 * 3_600))
+        clock.advance(7 * 3_600)
+        _ = await resolver.refresh()
+        let decision = await resolver.decide(export)
+        XCTAssertEqual(decision, .allow(.verified(age: 0)))
+    }
+
+    /// A device clock that runs fast must not fail closed right after a refresh.
+    func testFastDeviceClockIsFreshRightAfterRefresh() async {
+        let fast = TestClock(now: t0.addingTimeInterval(86_400))
+        let resolver = makeResolver(feed: GatedFeed([signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted]))], open: true),
+                                    clock: fast)
+        _ = await resolver.refresh()
+        let decision = await resolver.decide(export)
+        XCTAssertEqual(decision, .allow(.verified(age: 0)))
+    }
+
+    /// Relaunch (same boot), app unused for 70 h offline, clock rewound to the
+    /// verification time: the persisted monotonic reading still catches it.
+    func testPersistedMonotonicReadingSurvivesRelaunchInSameBoot() async {
+        let store = InMemorySnapshotStore()
+        let floor = InMemoryClockFloor()
+        let mark = InMemoryHighWaterMark()
+        let firstLaunch = TestClock(uptime: 1_000, bootID: "boot-A")
+        let before = makeResolver(feed: GatedFeed([signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted]))], open: true),
+                                  store: store, highWater: mark, clock: firstLaunch, clockFloor: floor)
+        _ = await before.refresh()
+        let relaunch = TestClock(now: t0, uptime: 1_000 + 70 * 3_600, bootID: "boot-A")
+        let after = makeResolver(feed: GatedFeed([], open: true), store: store, highWater: mark,
+                                 clock: relaunch, clockFloor: floor)
+        _ = await after.bootstrap()
+        let exportDecision = await after.decide(export)
+        XCTAssertEqual(exportDecision, .deny(.needsFreshState(age: 70 * 3_600)))
+    }
+
+    /// A different boot id invalidates the persisted uptime reading even if
+    /// the new boot's uptime happens to be larger.
+    func testPersistedMonotonicReadingIgnoredAcrossBoots() async {
+        let store = InMemorySnapshotStore()
+        let floor = InMemoryClockFloor()
+        let mark = InMemoryHighWaterMark()
+        let firstBoot = TestClock(uptime: 1_000, bootID: "boot-A")
+        let before = makeResolver(feed: GatedFeed([signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted]))], open: true),
+                                  store: store, highWater: mark, clock: firstBoot, clockFloor: floor)
+        _ = await before.refresh()
+        let secondBoot = TestClock(now: t0.addingTimeInterval(60), uptime: 500_000, bootID: "boot-B")
+        let after = makeResolver(feed: GatedFeed([], open: true), store: store, highWater: mark,
+                                 clock: secondBoot, clockFloor: floor)
+        _ = await after.bootstrap()
+        let decision = await after.decide(export)
+        XCTAssertEqual(decision, .allow(.verified(age: 60)), "a reading from boot A must not age state in boot B")
+    }
+
+    /// The journal is applied before the shared snapshot is adopted, so no
+    /// decision taken while bootstrap is suspended can miss a revocation.
+    func testJournalledRevocationHoldsWhileBootstrapIsSuspended() async {
+        let journal = InMemoryRevocationJournal()
+        await journal.record([movedToCarol])
+        let mark = GatedHighWater()
+        let store = InMemorySnapshotStore(signed(EntitlementSnapshot(sequence: 1, issuedAt: t0, seats: [granted])))
+        let resolver = makeResolver(feed: GatedFeed([], open: true), store: store, highWater: mark, journal: journal)
+        async let launch = resolver.bootstrap()
+        let held = await eventually { await mark.pendingRaises == 1 }
+        XCTAssertTrue(held)
+        let during = await resolver.decide(docs)
+        XCTAssertEqual(during, .deny(.revoked("S-1", version: 2)))
+        await mark.release()
+        _ = await launch
+    }
+
+    /// Other holders' seat moves are not this device's revocations: they stay
+    /// out of the journal (which would otherwise fill with entries no snapshot compacts).
+    func testOtherHoldersMovesAreNotJournalled() async {
+        let journal = InMemoryRevocationJournal()
+        let resolver = makeResolver(feed: GatedFeed([], open: true), journal: journal)
+        let bobToDan = event("S-7", v: 4, .assigned(.user("dan")), previous: .user("bob"))
+        await resolver.ingest([bobToDan])
+        let journalled = await journal.load()
+        XCTAssertTrue(journalled.isEmpty)
+    }
+
+    /// A revocation without an issuer-supplied previousHolder still counts when
+    /// the ledger knows the seat was this holder's.
+    func testUnassignedSeatThatWasMineIsJournalled() async {
+        let journal = InMemoryRevocationJournal()
+        let resolver = makeResolver(feed: GatedFeed([], open: true), journal: journal)
+        let refunded = event(v: 2, .refunded)
+        await resolver.ingest([granted, refunded])
+        let journalled = await journal.load()
+        XCTAssertEqual(journalled, [refunded])
+    }
 }
