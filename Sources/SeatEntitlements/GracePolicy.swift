@@ -84,11 +84,18 @@ public struct Verification: Hashable, Sendable {
     /// matches the current boot, the monotonic reading survives an app relaunch
     /// (it is persisted with the clock evidence), not only within one process.
     public let bootID: String?
+    /// The server's `issuedAt` of the snapshot that produced this evidence.
+    /// A later network snapshot only counts as a *new* proof if the server's
+    /// own clock has moved past this, so replaying an old signed snapshot
+    /// cannot renew freshness. (Server time is compared only with server time.)
+    public let serverIssuedAt: Date?
 
-    public init(verifiedAt: Date, uptimeAtVerification: TimeInterval?, bootID: String? = nil) {
+    public init(verifiedAt: Date, uptimeAtVerification: TimeInterval?, bootID: String? = nil,
+                serverIssuedAt: Date? = nil) {
         self.verifiedAt = verifiedAt
         self.uptimeAtVerification = uptimeAtVerification
         self.bootID = bootID
+        self.serverIssuedAt = serverIssuedAt
     }
 }
 

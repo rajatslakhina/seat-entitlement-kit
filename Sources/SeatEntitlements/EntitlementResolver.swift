@@ -22,16 +22,36 @@ extension EntitlementClock {
 public struct SystemEntitlementClock: EntitlementClock {
     public init() {}
     public func now() -> Date { Date() }
-    public func uptime() -> TimeInterval? { ProcessInfo.processInfo.systemUptime }
 
-    /// `kern.boottime` on Apple platforms, the kernel's boot id on Linux.
+    /// Seconds since boot, *including time asleep*. A clock that pauses during
+    /// sleep (`ProcessInfo.systemUptime`) would let an iPad that slept offline
+    /// all weekend recover the whole weekend with a clock rewind.
+    public func uptime() -> TimeInterval? {
+        #if canImport(Darwin)
+        // CLOCK_MONOTONIC_RAW is mach_continuous_time: it keeps counting in sleep.
+        let nanos = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+        guard nanos > 0 else { return ProcessInfo.processInfo.systemUptime }
+        return Double(nanos) / 1_000_000_000
+        #elseif os(Linux)
+        var spec = timespec()
+        guard clock_gettime(CLOCK_BOOTTIME, &spec) == 0 else { return ProcessInfo.processInfo.systemUptime }
+        return Double(spec.tv_sec) + Double(spec.tv_nsec) / 1_000_000_000
+        #else
+        return ProcessInfo.processInfo.systemUptime
+        #endif
+    }
+
+    /// A per-boot identifier: `kern.bootsessionuuid` on Apple platforms (unlike
+    /// `kern.boottime`, it does not change when the calendar clock is stepped),
+    /// the kernel's boot id on Linux.
     public func bootID() -> String? {
         #if canImport(Darwin)
-        var bootTime = timeval()
-        var size = MemoryLayout<timeval>.stride
-        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
-        guard sysctl(&mib, 2, &bootTime, &size, nil, 0) == 0 else { return nil }
-        return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
+        var size = 0
+        guard sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0) == 0, size > 0, size <= 256 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("kern.bootsessionuuid", &buffer, &size, nil, 0) == 0 else { return nil }
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return bytes.isEmpty ? nil : String(decoding: bytes, as: UTF8.self)
         #else
         let id = try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8)
         return id?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -88,6 +108,10 @@ public actor EntitlementResolver {
     private var newestAdoptedSequence: UInt64?
     private var wallFloor: Date?
     private var persistedFloor: Date?
+    /// Bumped by every floor reset; queued raises from before it are dropped.
+    private var floorGeneration: UInt64 = 0
+    /// Server `issuedAt` of the last snapshot accepted as a fresh network proof.
+    private var lastNetworkIssuedAt: Date?
     private var inFlight: Task<RefreshOutcome, Never>?
     private var inFlightGeneration: UInt64 = 0
     private var subscribers: [UUID: AsyncStream<SeatChange>.Continuation] = [:]
@@ -163,9 +187,11 @@ public actor EntitlementResolver {
             wallFloor = max(wallFloor ?? persisted, persisted)
             persistedFloor = max(persistedFloor ?? persisted, persisted)
         }
-        if let evidence = await clockFloor.loadVerification(),
-           Self.shouldReplace(verification, with: evidence) {
-            verification = evidence
+        if let evidence = await clockFloor.loadVerification() {
+            if let issued = evidence.serverIssuedAt {
+                lastNetworkIssuedAt = max(lastNetworkIssuedAt ?? issued, issued)
+            }
+            if Self.shouldReplace(verification, with: evidence) { verification = evidence }
         }
         let journalled = await journal.load()
         publish(ledger.apply(journalled))
@@ -247,8 +273,15 @@ public actor EntitlementResolver {
         let due = persistedFloor.map { floor.timeIntervalSince($0) >= Self.floorPersistInterval } ?? true
         guard due else { return }
         persistedFloor = floor
-        let store = clockFloor
-        Task { await store.raise(to: floor) }
+        let generation = floorGeneration
+        Task { await self.persistFloor(floor, generation: generation) }
+    }
+
+    /// Persist a raised floor unless a reset has happened since it was observed
+    /// (a stale raise must not re-poison a floor that a fresh proof just reset).
+    private func persistFloor(_ floor: Date, generation: UInt64) async {
+        guard generation == floorGeneration else { return }
+        await clockFloor.raise(to: floor)
     }
 
     private func performRefresh(generation: UInt64) async -> RefreshOutcome {
@@ -291,16 +324,22 @@ public actor EntitlementResolver {
         let outcomes = ledger.apply(snapshot.seats)
         publish(outcomes)
         var freshEvidence: Verification?
-        if fromNetwork {
+        // A network snapshot is a *new* proof only if the server's clock has
+        // moved past the last one; a replayed (or cached) snapshot is not.
+        var isNewProof = fromNetwork
+        if isNewProof, let last = lastNetworkIssuedAt, snapshot.issuedAt <= last { isNewProof = false }
+        if isNewProof {
             // A snapshot this process just fetched is a new proof that the
             // state is current. Age it from receipt on the device's own clock,
             // whatever that clock says, and re-anchor the wall-clock floor to it.
             let evidence = Verification(verifiedAt: receivedAt, uptimeAtVerification: clock.uptime(),
-                                        bootID: clock.bootID())
+                                        bootID: clock.bootID(), serverIssuedAt: snapshot.issuedAt)
             verification = evidence
             freshEvidence = evidence
+            lastNetworkIssuedAt = snapshot.issuedAt
             wallFloor = receivedAt
             persistedFloor = receivedAt
+            floorGeneration &+= 1
         } else {
             let candidate = Verification(verifiedAt: min(snapshot.issuedAt, receivedAt),
                                          uptimeAtVerification: nil)
