@@ -508,4 +508,61 @@ final class ResolverTests: XCTestCase {
         let journalled = await journal.load()
         XCTAssertEqual(journalled, [refunded])
     }
+
+    // MARK: Review round 3 regressions (1.1.1)
+
+    /// Re-serving the same signed snapshot (a proxy, a cache) must not renew
+    /// freshness: the server's own issuedAt has not moved.
+    func testReplayedSnapshotDoesNotRenewFreshness() async {
+        let clock = TestClock()
+        let same = signed(EntitlementSnapshot(sequence: 5, issuedAt: t0, seats: [granted]))
+        let feed = GatedFeed(Array(repeating: same, count: 41), open: true)
+        let resolver = makeResolver(feed: feed, clock: clock)
+        _ = await resolver.refresh()
+        for _ in 0..<40 {
+            clock.advance(86_400)
+            _ = await resolver.refresh()
+        }
+        let exportDecision = await resolver.decide(export)
+        let docsDecision = await resolver.decide(docs)
+        XCTAssertEqual(exportDecision, .deny(.needsFreshState(age: 40 * 86_400)))
+        XCTAssertEqual(docsDecision, .deny(.graceExhausted(age: 40 * 86_400)))
+    }
+
+    /// The replay guard survives a relaunch: the last server issuedAt is part
+    /// of the persisted evidence.
+    func testReplayAfterRelaunchDoesNotRenewFreshness() async {
+        let floor = InMemoryClockFloor()
+        let mark = InMemoryHighWaterMark()
+        let same = signed(EntitlementSnapshot(sequence: 5, issuedAt: t0, seats: [granted]))
+        let first = makeResolver(feed: GatedFeed([same], open: true), highWater: mark, clockFloor: floor)
+        _ = await first.refresh()
+        let later = TestClock(now: t0.addingTimeInterval(10 * 86_400), uptime: 5, bootID: "other-boot")
+        let relaunched = makeResolver(feed: GatedFeed([same], open: true), highWater: mark, clock: later, clockFloor: floor)
+        _ = await relaunched.bootstrap()
+        _ = await relaunched.refresh()
+        let decision = await relaunched.decide(export)
+        XCTAssertEqual(decision, .deny(.needsFreshState(age: 10 * 86_400)))
+    }
+
+    /// A genuinely newer snapshot (server clock moved on) is still a new proof.
+    func testNewerServerIssueTimeIsANewProof() async {
+        let clock = TestClock()
+        let feed = GatedFeed([signed(EntitlementSnapshot(sequence: 5, issuedAt: t0, seats: [granted])),
+                              signed(EntitlementSnapshot(sequence: 5, issuedAt: t0.addingTimeInterval(86_400), seats: [granted]))], open: true)
+        let resolver = makeResolver(feed: feed, clock: clock)
+        _ = await resolver.refresh()
+        clock.advance(86_400)
+        _ = await resolver.refresh()
+        let decision = await resolver.decide(export)
+        XCTAssertEqual(decision, .allow(.verified(age: 0)))
+    }
+
+    func testSystemClockReportsUptimeAndBootID() {
+        let clock = SystemEntitlementClock()
+        XCTAssertNotNil(clock.uptime())
+        XCTAssertGreaterThan(clock.uptime() ?? 0, 0)
+        // Stable within one process.
+        XCTAssertEqual(clock.bootID(), clock.bootID())
+    }
 }
