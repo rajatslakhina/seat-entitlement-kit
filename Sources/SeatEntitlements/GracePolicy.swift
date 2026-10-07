@@ -71,19 +71,24 @@ public enum Decision: Hashable, Sendable {
 
 /// When the device last verified signed state, in both clock domains.
 public struct Verification: Hashable, Sendable {
-    /// Device wall-clock time the state counts as verified at:
-    /// `min(server issuedAt, device clock at receipt)`. Never fresher than the
-    /// server says, never fresher than the moment it arrived, and immune to a
-    /// device clock that runs slow (the server's `issuedAt` is only compared
-    /// with the device clock through this `min`).
+    /// Device wall-clock time the state counts as verified at. For a snapshot
+    /// this process fetched, that is the device clock at receipt (so a device
+    /// clock that is wrong in either direction cannot make fresh state look old).
+    /// For a snapshot read from the shared store, it is
+    /// `min(server issuedAt, device clock at read)`, never fresher than either.
     public let verifiedAt: Date
-    /// Device uptime when it was verified, if this process saw it happen.
-    /// Uptime is monotonic within a boot and cannot be moved by the user.
+    /// Device uptime when it was verified. Uptime is monotonic within a boot
+    /// and cannot be moved by the user.
     public let uptimeAtVerification: TimeInterval?
+    /// Which boot `uptimeAtVerification` belongs to. When it is known and
+    /// matches the current boot, the monotonic reading survives an app relaunch
+    /// (it is persisted with the clock evidence), not only within one process.
+    public let bootID: String?
 
-    public init(verifiedAt: Date, uptimeAtVerification: TimeInterval?) {
+    public init(verifiedAt: Date, uptimeAtVerification: TimeInterval?, bootID: String? = nil) {
         self.verifiedAt = verifiedAt
         self.uptimeAtVerification = uptimeAtVerification
+        self.bootID = bootID
     }
 }
 
@@ -96,6 +101,7 @@ public enum EntitlementDecider {
                               verification: Verification?,
                               now: Date,
                               uptime: TimeInterval?,
+                              bootID: String? = nil,
                               wallClockFloor: Date? = nil,
                               policy: GracePolicy) -> Decision {
         let seats = ledger.seats(in: feature.group)
@@ -124,7 +130,10 @@ public enum EntitlementDecider {
         //    earlier than it, which closes the rewind-then-reboot gap where no
         //    monotonic reading survives.
         var monotonicAge: TimeInterval?
-        if let then = verification.uptimeAtVerification, let uptime, uptime >= then {
+        // A reading from a different boot is meaningless; with either boot id
+        // unknown, a smaller uptime is the only reboot signal available.
+        let sameBoot = verification.bootID == nil || bootID == nil || verification.bootID == bootID
+        if sameBoot, let then = verification.uptimeAtVerification, let uptime, uptime >= then {
             monotonicAge = uptime - then
         }
         if now.timeIntervalSince1970.isNaN { return .deny(.clockRollback) }

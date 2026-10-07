@@ -123,13 +123,32 @@ public actor InMemoryHighWaterMark: HighWaterMarkStore {
 
 // MARK: - Durability ports for state that is not in a signed snapshot
 
-/// The latest wall-clock time this device has ever observed, persisted across
-/// launches and reboots (a `ThisDeviceOnly` keychain item in production).
-/// It is the only clock defence left after a reboot erases monotonic uptime.
+/// Device-local clock evidence, persisted across launches and reboots (a
+/// `ThisDeviceOnly` keychain item in a shared access group, in production):
+/// the latest wall-clock time this device has observed (the *floor*), and the
+/// last network verification with its monotonic reading and boot id.
+///
+/// Since 1.1.0 the store can also *reset* the floor and persist the last
+/// verification. Both have default implementations, so a 1.0.x conformer
+/// still compiles: it keeps the 1.0 behaviour (floor only rises, monotonic
+/// evidence lasts one process).
 public protocol ClockFloorStore: Sendable {
     func load() async -> Date?
     /// Raises the floor; never lowers it.
     func raise(to date: Date) async
+    /// Replaces the floor. Called only after a network-fresh, signed refresh,
+    /// which proves the state is current whatever the device clock says, so a
+    /// floor poisoned by a clock once set forward cannot lock out a device
+    /// that is online and verified.
+    func reset(to date: Date) async
+    func loadVerification() async -> Verification?
+    func saveVerification(_ verification: Verification) async
+}
+
+extension ClockFloorStore {
+    public func reset(to date: Date) async { await raise(to: date) }
+    public func loadVerification() async -> Verification? { nil }
+    public func saveVerification(_ verification: Verification) async {}
 }
 
 /// Durable storage for *pushed* seat events that reduce this holder's access
@@ -154,12 +173,19 @@ public protocol RevocationJournal: Sendable {
 
 public actor InMemoryClockFloor: ClockFloorStore {
     private var floor: Date?
+    private var verification: Verification?
     public init(_ initial: Date? = nil) { floor = initial }
     public func load() -> Date? { floor }
     public func raise(to date: Date) {
         guard !date.timeIntervalSince1970.isNaN else { return }
         floor = max(floor ?? date, date)
     }
+    public func reset(to date: Date) {
+        guard !date.timeIntervalSince1970.isNaN else { return }
+        floor = date
+    }
+    public func loadVerification() -> Verification? { verification }
+    public func saveVerification(_ verification: Verification) { self.verification = verification }
 }
 
 public actor InMemoryRevocationJournal: RevocationJournal {

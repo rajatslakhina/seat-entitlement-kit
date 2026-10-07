@@ -10,12 +10,33 @@ public protocol EntitlementClock: Sendable {
     func now() -> Date
     /// Monotonic seconds since boot, or nil where unavailable.
     func uptime() -> TimeInterval?
+    /// An identifier for the current boot, so persisted uptime readings can be
+    /// trusted across app launches within one boot. Default: nil (unknown).
+    func bootID() -> String?
+}
+
+extension EntitlementClock {
+    public func bootID() -> String? { nil }
 }
 
 public struct SystemEntitlementClock: EntitlementClock {
     public init() {}
     public func now() -> Date { Date() }
     public func uptime() -> TimeInterval? { ProcessInfo.processInfo.systemUptime }
+
+    /// `kern.boottime` on Apple platforms, the kernel's boot id on Linux.
+    public func bootID() -> String? {
+        #if canImport(Darwin)
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+        guard sysctl(&mib, 2, &bootTime, &size, nil, 0) == 0 else { return nil }
+        return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
+        #else
+        let id = try? String(contentsOfFile: "/proc/sys/kernel/random/boot_id", encoding: .utf8)
+        return id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        #endif
+    }
 }
 
 public enum RefreshOutcome: Hashable, Sendable {
@@ -38,9 +59,12 @@ public enum RefreshOutcome: Hashable, Sendable {
 /// * `refresh()` is single-flight: concurrent callers share one fetch.
 /// * Snapshots are *merged*, never swapped in. A revocation pushed while a
 ///   fetch is suspended survives the (older) response that lands afterwards.
-/// * Verification time only moves forward, the persisted high-water mark and
-///   wall-clock floor only rise, so interleaved adoptions cannot regress
-///   freshness or reopen a rollback window.
+/// * A snapshot this process fetched is a fresh proof: it resets verification
+///   to *receipt* time and resets the wall-clock floor, so no device clock
+///   error (fast, slow, rewound, or set forward once) can lock out a device
+///   that is online and verified. Snapshots read from the shared store only
+///   ever move verification forward, and the high-water mark only rises, so
+///   interleaved adoptions cannot reopen a rollback window.
 /// * Pushed revocations are journalled before `ingest` returns, so they
 ///   survive a relaunch and reach Suite siblings; pushed grants are not.
 public actor EntitlementResolver {
@@ -109,7 +133,7 @@ public actor EntitlementResolver {
         observeWallClock(now)
         return EntitlementDecider.decide(feature: feature, context: context, ledger: ledger,
                                          verification: verification, now: now, uptime: clock.uptime(),
-                                         wallClockFloor: wallFloor, policy: policy)
+                                         bootID: clock.bootID(), wallClockFloor: wallFloor, policy: policy)
     }
 
     public func seats() -> [SeatEvent] { ledger.allSeats }
@@ -126,22 +150,27 @@ public actor EntitlementResolver {
 
     // MARK: Writes
 
-    /// Launch path: load the persisted wall-clock floor, adopt whatever a Suite
-    /// sibling last wrote to the shared store (re-verified here; a sibling is
-    /// not trusted just for being one), then replay the revocation journal.
+    /// Launch path, in this order: the persisted clock evidence (wall-clock
+    /// floor and last network verification, whose monotonic reading still
+    /// holds if this is the same boot), then the revocation journal, then
+    /// whatever a Suite sibling last wrote to the shared store (re-verified
+    /// here; a sibling is not trusted just for being one). The journal goes
+    /// before the store so that no `decide` running during the store's
+    /// suspensions can see a journalled revocation un-applied.
     /// Returns nil when the shared store is empty.
     public func bootstrap() async -> RefreshOutcome? {
         if let persisted = await clockFloor.load(), !persisted.timeIntervalSince1970.isNaN {
             wallFloor = max(wallFloor ?? persisted, persisted)
             persistedFloor = max(persistedFloor ?? persisted, persisted)
         }
-        var outcome: RefreshOutcome?
-        if let signed = await store.load() {
-            outcome = await adopt(signed, fromNetwork: false)
+        if let evidence = await clockFloor.loadVerification(),
+           Self.shouldReplace(verification, with: evidence) {
+            verification = evidence
         }
         let journalled = await journal.load()
         publish(ledger.apply(journalled))
-        return outcome
+        guard let signed = await store.load() else { return nil }
+        return await adopt(signed, fromNetwork: false)
     }
 
     /// Fetch and adopt the latest snapshot. Concurrent callers share one fetch.
@@ -150,12 +179,9 @@ public actor EntitlementResolver {
         if let inFlight { return await inFlight.value }
         inFlightGeneration &+= 1
         let generation = inFlightGeneration
-        let task = Task { await self.performRefresh() }
+        let task = Task { await self.performRefresh(generation: generation) }
         inFlight = task
-        let outcome = await task.value
-        // Only clear the slot if it still holds *our* task.
-        if inFlightGeneration == generation { inFlight = nil }
-        return outcome
+        return await task.value
     }
 
     /// Apply pushed seat events (StoreKit `Transaction.updates`, a server
@@ -163,15 +189,16 @@ public actor EntitlementResolver {
     /// JWS check. Pushed events change seats but never freshness: only a
     /// signed snapshot proves the *whole* state is current.
     ///
-    /// Applied events that do not grant this holder anything are journalled
+    /// Applied events that take a seat *away from this holder* are journalled
     /// before this returns, so a revocation survives a relaunch and reaches
-    /// Suite siblings. Grants stay in memory until a signed snapshot confirms them.
+    /// Suite siblings. Grants (and other holders' seat moves) stay in memory
+    /// until a signed snapshot confirms them.
     @discardableResult
     public func ingest(_ events: [SeatEvent]) async -> [SeatLedger.Outcome] {
         let outcomes = ledger.apply(events)
         publish(outcomes)
         var durable: [SeatEvent] = []
-        for case .applied(let change) in outcomes where change.current.state.holder?.matches(context) != true {
+        for case .applied(let change) in outcomes where Self.revokes(change, from: context) {
             durable.append(change.current)
         }
         if !durable.isEmpty { await journal.record(durable) }
@@ -198,6 +225,14 @@ public actor EntitlementResolver {
 
     // MARK: Internals
 
+    /// True when a change leaves this holder without a seat it had (or that
+    /// the issuer says it had). Never true for a change that grants it one.
+    static func revokes(_ change: SeatChange, from context: CheckContext) -> Bool {
+        guard change.current.state.holder?.matches(context) != true else { return false }
+        return change.current.previousHolder?.matches(context) == true
+            || change.previous?.state.holder?.matches(context) == true
+    }
+
     private func removeSubscriber(_ id: UUID) {
         subscribers[id] = nil
     }
@@ -216,15 +251,20 @@ public actor EntitlementResolver {
         Task { await store.raise(to: floor) }
     }
 
-    private func performRefresh() async -> RefreshOutcome {
+    private func performRefresh(generation: UInt64) async -> RefreshOutcome {
         fetchCount &+= 1
-        let signed: SignedSnapshot
+        let outcome: RefreshOutcome
         do {
-            signed = try await feed.fetchSnapshot()
+            let signed = try await feed.fetchSnapshot()
+            outcome = await adopt(signed, fromNetwork: true)
         } catch {
-            return .transportFailed(String(describing: error))
+            outcome = .transportFailed(String(describing: error))
         }
-        return await adopt(signed, fromNetwork: true)
+        // Free the slot on the actor *before* the result is handed out, so a
+        // caller arriving after this point starts a new fetch instead of
+        // joining a finished one.
+        if inFlightGeneration == generation { inFlight = nil }
+        return outcome
     }
 
     private func adopt(_ signed: SignedSnapshot, fromNetwork: Bool) async -> RefreshOutcome {
@@ -250,14 +290,31 @@ public actor EntitlementResolver {
         // further suspension, so the state is consistent at every await.
         let outcomes = ledger.apply(snapshot.seats)
         publish(outcomes)
-        let candidate = Verification(verifiedAt: min(snapshot.issuedAt, receivedAt),
-                                     uptimeAtVerification: fromNetwork ? clock.uptime() : nil)
-        if Self.shouldReplace(verification, with: candidate) { verification = candidate }
-        observeWallClock(receivedAt)
+        var freshEvidence: Verification?
+        if fromNetwork {
+            // A snapshot this process just fetched is a new proof that the
+            // state is current. Age it from receipt on the device's own clock,
+            // whatever that clock says, and re-anchor the wall-clock floor to it.
+            let evidence = Verification(verifiedAt: receivedAt, uptimeAtVerification: clock.uptime(),
+                                        bootID: clock.bootID())
+            verification = evidence
+            freshEvidence = evidence
+            wallFloor = receivedAt
+            persistedFloor = receivedAt
+        } else {
+            let candidate = Verification(verifiedAt: min(snapshot.issuedAt, receivedAt),
+                                         uptimeAtVerification: nil)
+            if Self.shouldReplace(verification, with: candidate) { verification = candidate }
+            observeWallClock(receivedAt)
+        }
         let isNewest = newestAdoptedSequence.map { snapshot.sequence >= $0 } ?? true
         if isNewest { newestAdoptedSequence = snapshot.sequence }
         lastRejection = nil
 
+        if let freshEvidence {
+            await clockFloor.reset(to: freshEvidence.verifiedAt)
+            await clockFloor.saveVerification(freshEvidence)
+        }
         await highWater.raise(to: snapshot.sequence)
         // Share with Suite siblings, unless a newer snapshot was adopted while
         // we were suspended above. Snapshots read from the store are never
