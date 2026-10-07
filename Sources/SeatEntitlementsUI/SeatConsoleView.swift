@@ -139,7 +139,10 @@ private struct ControlsView: View {
             action("MDM: reassign away", "person.crop.circle.badge.minus") { await model.reassignAway() }
             action("MDM: assign back", "person.crop.circle.badge.plus") { await model.reassignBack() }
             action("+12 hours", "clock.arrow.circlepath") { await model.advance(hours: 12) }
-            action("Clock back 48h", "clock.badge.exclamationmark") { await model.tamperClock() }
+            action(model.isClockTampered ? "Restore clock" : "Clock back 48h",
+                   model.isClockTampered ? "clock.arrow.2.circlepath" : "clock.badge.exclamationmark") {
+                await model.toggleClockTamper()
+            }
             action("Replay old event", "arrow.uturn.backward") { await model.replayStaleEvent() }
             action("Sibling + old cache", "square.stack.3d.up.slash") { await model.siblingLaunchWithRestoredCache() }
         }
@@ -170,6 +173,14 @@ private struct HerdScreen: View {
                 Text("\(herd.devices) devices assigned in one MDM push hit a backend that serves \(herd.capacityPerBucket) requests per \(Saturating.int(herd.bucketSeconds))s. Same fleet, same backend, three client strategies.")
                     .font(.callout)
             }
+            if !model.herdRows.isEmpty {
+                Section("Peak load vs capacity") {
+                    ForEach(model.herdRows) { row in
+                        LabeledContent(row.strategy.label, value: ratioText(row, herd))
+                            .foregroundStyle((row.result.peakOverCapacity(herd) ?? 0) > 1 ? Color.red : Color.green)
+                    }
+                }
+            }
             ForEach(model.herdRows) { row in
                 Section(row.strategy.label) {
                     HerdBars(values: row.bars, capacity: herd.capacityPerBucket)
@@ -188,6 +199,11 @@ private struct HerdScreen: View {
             }
         }
         .navigationTitle("Rollout herd")
+    }
+
+    private func ratioText(_ row: SeatConsoleModel.HerdRow, _ herd: HerdScenario) -> String {
+        guard let ratio = row.result.peakOverCapacity(herd) else { return "\(row.result.peak)" }
+        return "\(ratio.formatted(.number.precision(.fractionLength(1))))×"
     }
 
     private func peakText(_ row: SeatConsoleModel.HerdRow, _ herd: HerdScenario) -> String {

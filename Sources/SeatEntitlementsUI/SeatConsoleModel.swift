@@ -77,6 +77,7 @@ public final class SeatConsoleModel: ObservableObject {
     @Published public private(set) var log: [LogLine] = []
     @Published public private(set) var isOnline = true
     @Published public private(set) var isBusy = false
+    @Published public private(set) var isClockTampered = false
     @Published public private(set) var clockSummary = ""
     @Published public private(set) var verificationSummary = "Never verified"
     @Published public private(set) var nextRefreshSummary = ""
@@ -202,11 +203,19 @@ public final class SeatConsoleModel: ObservableObject {
         }
     }
 
-    /// Move the wall clock back two days, as a user could in Settings.
-    public func tamperClock() async {
+    /// Move the wall clock back two days, as a user could in Settings, or
+    /// put it right again.
+    public func toggleClockTamper() async {
         await perform {
-            self.clock.tamperWallClock(by: -48 * 3_600)
-            self.append("Wall clock moved back 48h. Decisions should not change: age is the larger of wall-clock age (measured from the device's clock floor) and monotonic uptime age", .warning)
+            if self.isClockTampered {
+                self.clock.tamperWallClock(by: 48 * 3_600)
+                self.isClockTampered = false
+                self.append("Wall clock restored", .info)
+            } else {
+                self.clock.tamperWallClock(by: -48 * 3_600)
+                self.isClockTampered = true
+                self.append("Wall clock moved back 48h. Age is the larger of wall-clock age (from the device's clock floor) and monotonic uptime age, so decisions do not loosen; a successful refresh re-anchors both clocks", .warning)
+            }
         }
     }
 
@@ -289,6 +298,7 @@ public final class SeatConsoleModel: ObservableObject {
         if let next = await resolver.nextScheduledRefresh(using: scenario.scheduler) {
             let slot = scenario.scheduler.offset(forDeviceKey: scenario.context.deviceID)
             nextRefreshSummary = "Next refresh " + Self.timestamp(next) + " (slot +\(Self.format(slot)) in window)"
+                + (next < now ? ", overdue" : "")
         } else {
             nextRefreshSummary = "Refresh due now"
         }
